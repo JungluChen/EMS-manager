@@ -5,6 +5,9 @@ from pathlib import Path
 from datetime import datetime
 import pandas as pd
 import streamlit as st
+import requests
+import base64
+import tempfile
 try:
     from streamlit_autorefresh import st_autorefresh
 except Exception:
@@ -57,12 +60,23 @@ def _list_archives():
 
 def load_history_db(date_str=None):
     if not HISTORY_DB.exists():
+        b = gh_download_file('historical_data/history.db')
+        if b:
+            tmp = Path(tempfile.gettempdir()) / 'history.db'
+            try:
+                tmp.write_bytes(b)
+                df = _read_history_db(str(tmp), date_str)
+                return df
+            except Exception:
+                return pd.DataFrame()
         return pd.DataFrame()
+    return _read_history_db(str(HISTORY_DB), date_str)
+
+def _read_history_db(db_file, date_str=None):
     try:
-        conn = sqlite3.connect(str(HISTORY_DB))
+        conn = sqlite3.connect(db_file)
         cur = conn.cursor()
         if date_str:
-            # Filter by date part of ts (prefix match)
             cur.execute("SELECT ts, data FROM records WHERE ts LIKE ? ORDER BY ts ASC", (date_str + '%',))
         else:
             cur.execute("SELECT ts, data FROM records ORDER BY ts ASC")
@@ -73,15 +87,7 @@ def load_history_db(date_str=None):
                 obj = json.loads(data) if isinstance(data, str) else {}
             except Exception:
                 obj = {}
-            # normalize schema
-            recs.append({
-                'ts': ts,
-                'line': obj.get('line'),
-                'shift': obj.get('shift'),
-                'work_order': obj.get('work_order'),
-                'temperature': obj.get('temperature'),
-                'current': obj.get('current')
-            })
+            recs.append({'ts': ts, 'line': obj.get('line'), 'shift': obj.get('shift'), 'work_order': obj.get('work_order'), 'temperature': obj.get('temperature'), 'current': obj.get('current')})
         df = pd.DataFrame(recs)
         if not df.empty:
             df['ts_dt'] = pd.to_datetime(df['ts'], errors='coerce')
@@ -206,9 +212,11 @@ def historical_page():
             if confirm == 'DELETE':
                 ok = False
                 try:
-                    conn = sqlite3.connect(str(HISTORY_DB))
-                    cur = conn.cursor(); cur.execute('DELETE FROM records'); conn.commit(); cur.execute('VACUUM'); conn.commit(); conn.close()
-                    ok = True
+                    if HISTORY_DB.exists():
+                        conn = sqlite3.connect(str(HISTORY_DB))
+                        cur = conn.cursor(); cur.execute('DELETE FROM records'); conn.commit(); cur.execute('VACUUM'); conn.commit(); conn.close(); ok = True
+                    if not HISTORY_DB.exists() and gh_secrets_ok():
+                        ok = gh_reset_history_db()
                 except Exception:
                     ok = False
                 if ok:
@@ -225,6 +233,62 @@ def main():
         realtime_page()
     else:
         historical_page()
+
+def gh_secrets_ok():
+    try:
+        _ = st.secrets["GIT_TOKEN"]
+        _ = st.secrets["GIT_OWNER"]
+        _ = st.secrets["GIT_REPO"]
+        return True
+    except Exception:
+        return False
+
+def gh_headers():
+    try:
+        token = st.secrets["GIT_TOKEN"]
+        return {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"}
+    except Exception:
+        return {}
+
+def gh_owner_repo_branch():
+    owner = st.secrets.get("GIT_OWNER", "")
+    repo = st.secrets.get("GIT_REPO", "")
+    branch = st.secrets.get("GIT_BRANCH", "main")
+    return owner, repo, branch
+
+def gh_download_file(path):
+    if not gh_secrets_ok():
+        return None
+    owner, repo, branch = gh_owner_repo_branch()
+    url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}?ref={branch}"
+    r = requests.get(url, headers=gh_headers(), timeout=15)
+    if r.status_code == 200:
+        j = r.json()
+        c = j.get('content')
+        if c:
+            try:
+                return base64.b64decode(c)
+            except Exception:
+                return None
+    return None
+
+def gh_reset_history_db():
+    try:
+        owner, repo, branch = gh_owner_repo_branch()
+        get_url = f"https://api.github.com/repos/{owner}/{repo}/contents/historical_data/history.db?ref={branch}"
+        r = requests.get(get_url, headers=gh_headers(), timeout=15)
+        sha = r.json().get('sha') if r.status_code == 200 else None
+        tmp = Path(tempfile.gettempdir()) / 'empty_history.db'
+        conn = sqlite3.connect(str(tmp)); cur = conn.cursor(); cur.execute('CREATE TABLE IF NOT EXISTS records (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, data TEXT NOT NULL)'); conn.commit(); conn.close()
+        content_b64 = base64.b64encode(tmp.read_bytes()).decode('utf-8')
+        put_url = f"https://api.github.com/repos/{owner}/{repo}/contents/historical_data/history.db"
+        payload = {"message": "reset history.db", "content": content_b64, "branch": branch}
+        if sha:
+            payload["sha"] = sha
+        pr = requests.put(put_url, headers=gh_headers(), json=payload, timeout=15)
+        return 200 <= pr.status_code < 300
+    except Exception:
+        return False
 
 if __name__ == '__main__':
     main()
