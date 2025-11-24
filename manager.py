@@ -213,11 +213,18 @@ def list_archives():
     url = f"https://api.github.com/repos/{owner}/{repo}/contents/historical_data/archives?ref={branch}"
 
     r = requests.get(url, headers=gh_headers(), timeout=15)
+
+    # 若錯誤或不存在此資料夾 → 回傳空陣列避免 TypeError
     if r.status_code != 200:
         return []
 
-    files = r.json()
-    return [f for f in files if f["name"].endswith(".csv")]
+    data = r.json()
+
+    # 若 GitHub 回應不是 list（例如：dict message）→ 回傳空 list 避免爆炸
+    if not isinstance(data, list):
+        return []
+
+    return [f for f in data if isinstance(f, dict) and f.get("name", "").endswith(".csv")]
 
 
 def load_archive_csv(name):
@@ -385,4 +392,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
