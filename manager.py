@@ -318,8 +318,10 @@ def history_page():
             df = load_history_db(date_filter=sel)
             src = "history.db"
         else:
-            df = load_archive_csv(sel + ".csv")
-            src = "archives/*.csv"
+            filename = sel if sel.endswith(".csv") else sel + ".csv"
+            df = load_archive_csv(filename)
+            src = f"archives/{filename}"
+
 
         if df.empty:
             st.info("没有记录")
@@ -383,3 +385,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
