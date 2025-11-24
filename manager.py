@@ -318,16 +318,26 @@ def history_page():
     tab_view, tab_manage = st.tabs(["浏览", "维护"])
 
     with tab_view:
+    
+        # 若沒有任何日期 → 直接返回
+        if len(names) == 0:
+            st.warning("尚无任何历史资料（history.db 与 archives 皆为空）")
+            return
+    
         sel = st.selectbox("选择日期", names)
-
+    
         # 若 history.db 有該日期
         if sel in dates_db:
             df = load_history_db(date_filter=sel)
             src = "history.db"
         else:
-            filename = sel if sel.endswith(".csv") else sel + ".csv"
+            filename = str(sel)
+            if not filename.endswith(".csv"):
+                filename = filename + ".csv"
+    
             df = load_archive_csv(filename)
             src = f"archives/{filename}"
+
 
 
         if df.empty:
@@ -392,5 +402,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
