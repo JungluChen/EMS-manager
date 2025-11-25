@@ -131,14 +131,15 @@ def load_sqlite_from_bytes(db_bytes, date_filter=None):
 # ============================================================
 # Real-time DB
 # ============================================================
-
 def load_realtime_db():
-    db = gh_download_file("real_time_monitoring/temp/ems.db")
+    # ← 修正這裡的路徑（移除 temp/）
+    db = gh_download_file("real_time_monitoring/ems.db")
     if not db:
         return pd.DataFrame()
 
     tmp = Path(tempfile.gettempdir()) / "realtime.sqlite"
     tmp.write_bytes(db)
+
     try:
         conn = sqlite3.connect(tmp)
         cur = conn.cursor()
@@ -402,6 +403,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
