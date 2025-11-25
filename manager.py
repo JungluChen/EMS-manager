@@ -54,6 +54,15 @@ def gh_download_file(path):
     except:
         return None
 
+def _decompress_if_gz(path, b):
+    try:
+        if path.endswith('.gz') and b:
+            import gzip
+            return gzip.decompress(b)
+    except:
+        pass
+    return b
+
 # 上傳（或覆蓋）GitHub Repo 的檔案
 def gh_upload_file(path, content_bytes, message="update file"):
     owner, repo, branch = gh_owner_repo_branch()
@@ -132,10 +141,14 @@ def load_sqlite_from_bytes(db_bytes, date_filter=None):
 # Real-time DB
 # ============================================================
 def load_realtime_db():
-    # ← 修正這裡的路徑（移除 temp/）
+    # 優先讀取未壓縮，失敗則讀取壓縮檔
     db = gh_download_file("real_time_monitoring/ems.db")
     if not db:
-        return pd.DataFrame()
+        db_gz = gh_download_file("real_time_monitoring/ems.db.gz")
+        if db_gz:
+            db = _decompress_if_gz("real_time_monitoring/ems.db.gz", db_gz)
+        if not db:
+            return pd.DataFrame()
 
     tmp = Path(tempfile.gettempdir()) / "realtime.sqlite"
     tmp.write_bytes(db)
@@ -177,9 +190,14 @@ def load_realtime_db():
 # ============================================================
 
 def load_history_db(date_filter=None):
+    # 優先讀取未壓縮，失敗則讀取壓縮檔
     db = gh_download_file("historical_data/history.db")
     if not db:
-        return pd.DataFrame()
+        db_gz = gh_download_file("historical_data/history.db.gz")
+        if db_gz:
+            db = _decompress_if_gz("historical_data/history.db.gz", db_gz)
+        if not db:
+            return pd.DataFrame()
     return load_sqlite_from_bytes(db, date_filter=date_filter)
 
 def clear_history_db():
@@ -403,7 +421,6 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 
 
 
