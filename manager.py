@@ -145,6 +145,33 @@ def load_sqlite_from_bytes(db_bytes, date_filter=None):
 
     return df
 
+def _format_duration(sec):
+    try:
+        sec = int(max(0, float(sec)))
+    except:
+        sec = 0
+    h = sec // 3600
+    m = (sec % 3600) // 60
+    s = sec % 60
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+def _compute_line_runtime(df):
+    runtimes = {}
+    try:
+        if df.empty or "line" not in df.columns or "ts_dt" not in df.columns:
+            return runtimes
+        for line in sorted([x for x in df["line"].dropna().unique().tolist()]):
+            series = df[df["line"] == line]["ts_dt"].dropna()
+            if series.empty:
+                continue
+            tmin = series.min()
+            tmax = series.max()
+            rt = (tmax - tmin).total_seconds() if (tmax and tmin) else 0
+            runtimes[line] = rt
+        return runtimes
+    except:
+        return {}
+
 
 # ============================================================
 # Real-time DB
@@ -289,6 +316,7 @@ def realtime_page():
 
     latest = df.sort_values("ts_dt").groupby("line").tail(1)
     lines = sorted(latest["line"].dropna().unique().tolist())
+    runtimes = _compute_line_runtime(df)
 
     cols = st.columns(len(lines))
 
@@ -300,10 +328,13 @@ def realtime_page():
         with cols[i]:
             st.metric(f"{line} Temperature (°C)", f"{temp:.1f}")
             st.metric(f"{line} Current (A)", f"{curr:.2f}")
+            st.metric(f"{line} 运行时长", _format_duration(runtimes.get(line, 0)))
 
     st.divider()
     st.subheader("设备快照")
-    st.dataframe(latest.reset_index(drop=True))
+    snap = latest.reset_index(drop=True).copy()
+    snap["runtime"] = snap.apply(lambda r: _format_duration(runtimes.get(r.get("line"), 0)), axis=1)
+    st.dataframe(snap)
 
     st.divider()
     st.subheader("趋势")
@@ -378,8 +409,11 @@ def history_page():
             df = df[df["work_order"] == sel_order]
 
         # 最新 snapshot
+        runtimes = _compute_line_runtime(df)
         snapshot = df.sort_values("ts_dt").groupby("line").tail(1)
-        st.dataframe(snapshot.reset_index(drop=True))
+        snap = snapshot.reset_index(drop=True).copy()
+        snap["runtime"] = snap.apply(lambda r: _format_duration(runtimes.get(r.get("line"), 0)), axis=1)
+        st.dataframe(snap)
 
         # 趋势图
         for line in sorted(df["line"].dropna().unique()):
