@@ -36,23 +36,32 @@ def gh_owner_repo_branch():
         st.secrets.get("GIT_BRANCH", "main"),
     )
 
+def gh_repos():
+    primary = st.secrets.get("GIT_REPO", "")
+    alts = st.secrets.get("ALT_REPOS", "EMS,recording")
+    names = [x.strip() for x in (primary + "," + alts).split(",") if x.strip()]
+    seen = set(); out = []
+    for n in names:
+        if n not in seen:
+            out.append(n); seen.add(n)
+    return out
+
 # 下載 GitHub Repo 的檔案（回傳 bytes）
 def gh_download_file(path):
-    owner, repo, branch = gh_owner_repo_branch()
-    url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}?ref={branch}"
-
-    r = requests.get(url, headers=gh_headers(), timeout=20)
-    if r.status_code != 200:
-        return None
-
-    content = r.json().get("content", None)
-    if not content:
-        return None
-
-    try:
-        return base64.b64decode(content)
-    except:
-        return None
+    owner, _, branch = gh_owner_repo_branch()
+    for repo in gh_repos():
+        url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}?ref={branch}"
+        r = requests.get(url, headers=gh_headers(), timeout=20)
+        if r.status_code != 200:
+            continue
+        content = r.json().get("content", None)
+        if not content:
+            continue
+        try:
+            return base64.b64decode(content)
+        except:
+            continue
+    return None
 
 def _decompress_if_gz(path, b):
     try:
@@ -228,22 +237,18 @@ def clear_history_db():
 # ============================================================
 
 def list_archives():
-    owner, repo, branch = gh_owner_repo_branch()
-    url = f"https://api.github.com/repos/{owner}/{repo}/contents/historical_data/archives?ref={branch}"
-
-    r = requests.get(url, headers=gh_headers(), timeout=15)
-
-    # 若錯誤或不存在此資料夾 → 回傳空陣列避免 TypeError
-    if r.status_code != 200:
-        return []
-
-    data = r.json()
-
-    # 若 GitHub 回應不是 list（例如：dict message）→ 回傳空 list 避免爆炸
-    if not isinstance(data, list):
-        return []
-
-    return [f for f in data if isinstance(f, dict) and f.get("name", "").endswith(".csv")]
+    owner, _, branch = gh_owner_repo_branch()
+    out = []
+    for repo in gh_repos():
+        url = f"https://api.github.com/repos/{owner}/{repo}/contents/historical_data/archives?ref={branch}"
+        r = requests.get(url, headers=gh_headers(), timeout=15)
+        if r.status_code != 200:
+            continue
+        data = r.json()
+        if not isinstance(data, list):
+            continue
+        out.extend([f for f in data if isinstance(f, dict) and f.get("name", "").endswith(".csv")])
+    return out
 
 
 def load_archive_csv(name):
