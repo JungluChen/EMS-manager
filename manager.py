@@ -110,6 +110,11 @@ def init_rt_state():
 @st.fragment(run_every=5)
 def realtime_page():
     init_rt_state()
+    # 自動刷新（跨版本兼容）：存在 st.autorefresh 則使用，否則依片段更新
+    try:
+        getattr(st, "autorefresh")(interval=5000, key="rt_auto")
+    except Exception:
+        pass
     with st.spinner("讀取即時資料中..."):
         db_bytes, status = gh_download_file("Data/local/local_realtime.db")
         df = load_sqlite_bytes(db_bytes)
@@ -182,6 +187,7 @@ def realtime_page():
             except Exception:
                 pass
     df_plot = df.dropna(subset=["ts_dt"]).copy()
+    st.caption(f"筆數：{len(df_plot)}，最新時間：{max_ts}")
     df_melt = df_plot.melt(id_vars=["ts_dt"], value_vars=["temperature", "current"], var_name="type", value_name="value")
     df_melt = df_melt.dropna(subset=["value"])
     chart = (
