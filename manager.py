@@ -188,10 +188,80 @@ def load_realtime_db():
 
 
 def load_history_db(date_filter=None):
+    """
+    更強健的 history.db 讀取器：
+    - 自動偵測表名
+    - 自動偵測欄位
+    - 自動 mapping 成標準欄位
+    """
     db = gh_download_file("Data/local/local_historical.db")
     if not db:
         return pd.DataFrame()
-    return load_sqlite_from_bytes(db, date_filter=date_filter)
+
+    tmp = Path(tempfile.gettempdir()) / "tmp_history.sqlite"
+    tmp.write_bytes(db)
+
+    try:
+        conn = sqlite3.connect(tmp)
+        cur = conn.cursor()
+
+        # 自動找出第一個資料表
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        table_list = [row[0] for row in cur.fetchall()]
+        if not table_list:
+            conn.close()
+            return pd.DataFrame()
+
+        table = table_list[0]  # 使用第一個表
+
+        # 讀取全部資料
+        cur.execute(f"PRAGMA table_info('{table}')")
+        cols = [row[1] for row in cur.fetchall()]
+
+        df = pd.read_sql_query(f"SELECT * FROM {table}", conn)
+        conn.close()
+
+    except Exception as e:
+        st.error(f"讀取歷史資料庫失敗：{e}")
+        return pd.DataFrame()
+
+    # ---- 欄位 mapping 成統一格式 ----
+    rename_map = {}
+
+    for c in df.columns:
+        lc = c.lower()
+        if lc in ("id",):
+            rename_map[c] = "id"
+        elif "work" in lc:
+            rename_map[c] = "work_order"
+        elif "shift" in lc:
+            rename_map[c] = "shift"
+        elif "device" in lc:
+            rename_map[c] = "device"
+        elif "timestamp" in lc:
+            rename_map[c] = "timestamp"
+        elif "time_str" in lc or "timestr" in lc or "time" in lc:
+            rename_map[c] = "time_str"
+        elif "temp" in lc:
+            rename_map[c] = "temperature"
+        elif "curr" in lc:
+            rename_map[c] = "current"
+
+    df = df.rename(columns=rename_map)
+
+    # ---- 只保留標準欄位 ----
+    for col in ["id", "work_order", "shift", "device", "timestamp", "time_str", "temperature", "current"]:
+        if col not in df.columns:
+            df[col] = None  # 補齊
+
+    # ---- 轉換 timestamp/timestr ----
+    df["ts_dt"] = pd.to_datetime(df["time_str"], errors="coerce")
+
+    # ---- 日期過濾 ----
+    if date_filter:
+        df = df[df["time_str"].str.startswith(date_filter)]
+
+    return df.sort_values("ts_dt")
 
 
 def clear_history_db():
@@ -360,3 +430,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
