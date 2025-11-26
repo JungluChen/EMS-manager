@@ -199,9 +199,18 @@ def load_history_db(date_filter=None):
     db = gh_download_file("Data/local/local_historical.db")
     if not db:
         return pd.DataFrame()
+    db = gh_download_file("Data/local/local_historical.db")
+    
+    if db:
+        st.warning(f"downloaded DB size = {len(db)} bytes")   # 🟡 這行用來驗證大小
+    else:
+        st.error("無法下載 DB (None returned)")
 
     tmp = Path(tempfile.gettempdir()) / "tmp_history.sqlite"
     tmp.write_bytes(db)
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    table_list = [row[0] for row in cur.fetchall()]
+    st.warning(f"tables detected: {table_list}")
 
     try:
         conn = sqlite3.connect(tmp)
@@ -432,6 +441,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
