@@ -4,32 +4,36 @@ import sqlite3
 import requests
 import base64
 import tempfile
-import time
-import plotly.graph_objects as go
 from pathlib import Path
+from datetime import datetime
 
-
-# -----------------------------------------------------------
-# Streamlit Page Config
-# -----------------------------------------------------------
+# ============================================================
+# Streamlit 設定
+# ============================================================
 st.set_page_config(page_title="EMS 管理台", layout="wide")
+st.title("EMS 管理台")
 
+# ============================================================
+# GitHub 固定設定（避免讀 recording）
+# ============================================================
+GIT_OWNER  = st.secrets["GIT_OWNER"]
+GIT_REPO   = st.secrets["GIT_REPO"]  # must be EMS
+GIT_BRANCH = st.secrets["GIT_BRANCH"]
+GIT_TOKEN  = st.secrets["GIT_TOKEN"]
 
-# -----------------------------------------------------------
-# GitHub Download Function
-# -----------------------------------------------------------
 def gh_headers():
     return {
-        "Authorization": f"Bearer {st.secrets['GIT_TOKEN']}",
+        "Authorization": f"Bearer {GIT_TOKEN}",
         "Accept": "application/vnd.github+json"
     }
 
-
 def gh_download_file(path):
-    url = f"https://api.github.com/repos/{st.secrets['GIT_OWNER']}/{st.secrets['GIT_REPO']}/contents/{path}?ref={st.secrets['GIT_BRANCH']}"
+    """只讀取 EMS repo"""
+    url = f"https://api.github.com/repos/{GIT_OWNER}/{GIT_REPO}/contents/{path}?ref={GIT_BRANCH}"
     r = requests.get(url, headers=gh_headers(), timeout=20)
 
     if r.status_code != 200:
+        st.error(f"下載失敗：HTTP {r.status_code} → {path}")
         return None
 
     js = r.json()
@@ -39,12 +43,12 @@ def gh_download_file(path):
     try:
         return base64.b64decode(js["content"])
     except:
+        st.error(f"Base64 解碼失敗：{path}")
         return None
 
-
-# -----------------------------------------------------------
-# SQLite Loader
-# -----------------------------------------------------------
+# ============================================================
+# SQLite 自動解析（標準化欄位）
+# ============================================================
 def load_sqlite_bytes(db_bytes):
     if not db_bytes:
         return pd.DataFrame()
@@ -55,148 +59,155 @@ def load_sqlite_bytes(db_bytes):
     try:
         conn = sqlite3.connect(tmp)
         cur = conn.cursor()
+
         cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
         tables = [x[0] for x in cur.fetchall()]
         if not tables:
             conn.close()
             return pd.DataFrame()
+
         table = tables[0]
         df = pd.read_sql_query(f"SELECT * FROM {table}", conn)
         conn.close()
 
-    except:
+    except Exception as e:
+        st.error(f"SQLite 讀取失敗：{e}")
         return pd.DataFrame()
 
-    # Rename columns
-    rename = {}
-    for col in df.columns:
-        c = col.lower()
-        if c == "id":
-            rename[col] = "id"
-        elif "work" in c:
-            rename[col] = "work_order"
-        elif "shift" in c:
-            rename[col] = "shift"
-        elif "device" in c:
-            rename[col] = "device"
-        elif "timestamp" in c:
-            rename[col] = "timestamp"
-        elif "time" in c:
-            rename[col] = "time_str"
-        elif "temp" in c:
-            rename[col] = "temperature"
-        elif "curr" in c:
-            rename[col] = "current"
+    # 欄位 mapping
+    rename_map = {}
+    for c in df.columns:
+        lc = c.lower()
+        if lc == "id": rename_map[c] = "id"
+        elif "work" in lc: rename_map[c] = "work_order"
+        elif "shift" in lc: rename_map[c] = "shift"
+        elif "device" in lc: rename_map[c] = "device"
+        elif "timestamp" in lc: rename_map[c] = "timestamp"
+        elif "time" in lc: rename_map[c] = "time_str"
+        elif "temp" in lc: rename_map[c] = "temperature"
+        elif "curr" in lc: rename_map[c] = "current"
 
-    df = df.rename(columns=rename)
+    df = df.rename(columns=rename_map)
 
-    # Fill missing columns
-    needed = ["id", "work_order", "shift", "device", "timestamp", "time_str", "temperature", "current"]
-    for col in needed:
+    # 必要欄位補齊
+    for col in ["id", "work_order", "shift", "device", "timestamp", "time_str", "temperature", "current"]:
         if col not in df.columns:
             df[col] = None
 
     df["ts_dt"] = pd.to_datetime(df["time_str"], errors="coerce")
+
     return df.sort_values("ts_dt")
 
-
-# -----------------------------------------------------------
-# 📡 Realtime Page (Zoomable + No Duplicate Keys)
-# -----------------------------------------------------------
+# ============================================================
+# 📡 實時資料頁面（✔折線圖 ✔不刷新整頁）
+# ============================================================
 def realtime_page():
+    st.header("📡 即時資料（每 5 秒自動更新）")
 
-    st.header("📡 即時趨勢圖（Zoomable，5 秒自動更新）")
+    placeholder = st.empty()
 
-    # container only refreshes content inside (no duplicate keys)
-    plot_container = st.container()
+    import time
 
-    # Start loop
-    while True:
-
-        # ⛔ If user switches page → stop loop
-        if st.session_state.get("current_page") != "實時資料":
-            break
+    # 只刷新內容，不刷新整頁
+    for _ in range(1_000_000):
 
         db_bytes = gh_download_file("Data/local/local_realtime.db")
         df = load_sqlite_bytes(db_bytes)
 
-        with plot_container:
-            st.subheader("裝置圖表 (Auto-refresh)")
-
+        with placeholder:
             if df.empty:
-                st.warning("尚無資料")
-                time.sleep(5)
-                continue
+                st.info("尚無即時資料")
+            else:
+                st.subheader("📈 溫度（Temperature）")
+                df_temp = df[["ts_dt", "temperature"]].dropna()
+                if not df_temp.empty:
+                    st.line_chart(
+                        df_temp.set_index("ts_dt"),
+                        height=300
+                    )
 
-            df["temperature"] = pd.to_numeric(df["temperature"], errors="coerce")
-            df["current"] = pd.to_numeric(df["current"], errors="coerce")
-            df = df.dropna(subset=["ts_dt"])
+                st.subheader("📉 電流（Current）")
+                df_curr = df[["ts_dt", "current"]].dropna()
+                if not df_curr.empty:
+                    st.line_chart(
+                        df_curr.set_index("ts_dt"),
+                        height=300
+                    )
 
-            devices = sorted(df["device"].dropna().unique())
-
-            for dev in devices:
-                dev_df = df[df["device"] == dev].sort_values("ts_dt")
-                if dev_df.empty:
-                    continue
-
-                st.markdown(f"### 📟 裝置：**{dev}**")
-
-                # ---------------------------------------------------------
-                # Temperature plot
-                # ---------------------------------------------------------
-                fig_temp = go.Figure()
-                fig_temp.add_trace(go.Scatter(
-                    x=dev_df["ts_dt"],
-                    y=dev_df["temperature"],
-                    mode="lines",
-                    line=dict(color="red", width=2),
-                ))
-                fig_temp.update_layout(
-                    title="Temperature (°C)",
-                    height=280,
-                    xaxis_title="Time",
-                    yaxis_title="°C",
-                    margin=dict(l=10, r=10, t=40, b=10)
-                )
-
-                st.plotly_chart(fig_temp, width="stretch", key=f"temp_{dev}_{time.time()}")
-
-                # ---------------------------------------------------------
-                # Current plot
-                # ---------------------------------------------------------
-                fig_curr = go.Figure()
-                fig_curr.add_trace(go.Scatter(
-                    x=dev_df["ts_dt"],
-                    y=dev_df["current"],
-                    mode="lines",
-                    line=dict(color="blue", width=2),
-                ))
-                fig_curr.update_layout(
-                    title="Current (A)",
-                    height=280,
-                    xaxis_title="Time",
-                    yaxis_title="A",
-                    margin=dict(l=10, r=10, t=40, b=10)
-                )
-
-                st.plotly_chart(fig_curr, width="stretch", key=f"curr_{dev}_{time.time()}")
-
-        # Refresh every 5 seconds
         time.sleep(5)
 
+        # 若切換頁面 → 結束（否則進入死循環）
+        if st.session_state.get("current_page") != "實時資料":
+            break
 
-# -----------------------------------------------------------
-# Dummy History Page
-# -----------------------------------------------------------
+
+# ============================================================
+# 📚 歷史資料頁面（完整）
+# ============================================================
 def history_page():
     st.header("📚 歷史資料")
-    st.info("History page placeholder.")
+
+    db_bytes = gh_download_file("Data/local/local_historical.db")
+    df = load_sqlite_bytes(db_bytes)
+
+    if df.empty:
+        st.info("尚無歷史資料")
+        return
+
+    df["date"] = df["time_str"].str[:10]
+
+    # 日期篩選
+    dates = sorted(df["date"].dropna().unique())
+    sel_date = st.selectbox("選擇日期", dates)
+    df = df[df["date"] == sel_date]
+
+    # 工單篩選
+    orders = sorted(df["work_order"].dropna().unique())
+    sel_order = st.selectbox("工單", ["全部"] + orders)
+
+    if sel_order != "全部":
+        df = df[df["work_order"] == sel_order]
+
+    # 機器篩選
+    devices = sorted(df["device"].dropna().unique())
+    sel_dev = st.selectbox("機器", ["全部"] + devices)
+
+    if sel_dev != "全部":
+        df = df[df["device"] == sel_dev]
+
+    st.subheader("📄 篩選後資料表")
+    st.dataframe(df, use_container_width=True)
+
+    # ============================================================
+    # 📈 歷史趨勢圖（依機器拆開）
+    # ============================================================
+    df["temperature"] = pd.to_numeric(df["temperature"], errors="coerce")
+    df["current"] = pd.to_numeric(df["current"], errors="coerce")
+
+    st.subheader("📈 歷史趨勢（依機器）")
+
+    for dev in sorted(df["device"].dropna().unique()):
+        dev_df = df[df["device"] == dev]
+        st.markdown(f"### 🟦 Device: **{dev}**")
+
+        c1, c2 = st.columns(2)
+
+        with c1:
+            st.write("Temperature")
+            st.line_chart(dev_df.set_index("ts_dt")["temperature"], height=250)
+
+        with c2:
+            st.write("Current")
+            st.line_chart(dev_df.set_index("ts_dt")["current"], height=250)
 
 
-# -----------------------------------------------------------
-# Navigation
-# -----------------------------------------------------------
+
+# ============================================================
+# Main
+# ============================================================
 page = st.sidebar.radio("選單", ["實時資料", "歷史資料"])
+
+# 記錄目前所在頁面（讓即時頁面可中斷 while loop）
 st.session_state["current_page"] = page
 
 if page == "實時資料":
