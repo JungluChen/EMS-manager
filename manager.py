@@ -8,6 +8,7 @@ import time
 import plotly.graph_objects as go
 from pathlib import Path
 
+
 # -----------------------------------------------------------
 # Streamlit Page Config
 # -----------------------------------------------------------
@@ -29,18 +30,15 @@ def gh_download_file(path):
     r = requests.get(url, headers=gh_headers(), timeout=20)
 
     if r.status_code != 200:
-        st.error(f"下載失敗：HTTP {r.status_code} → {path}")
         return None
 
     js = r.json()
     if "content" not in js:
-        st.error(f"GitHub content missing → {path}")
         return None
 
     try:
         return base64.b64decode(js["content"])
     except:
-        st.error(f"Base64 decode error → {path}")
         return None
 
 
@@ -48,7 +46,6 @@ def gh_download_file(path):
 # SQLite Loader
 # -----------------------------------------------------------
 def load_sqlite_bytes(db_bytes):
-    """讀取 SQLite Byte → DataFrame"""
     if not db_bytes:
         return pd.DataFrame()
 
@@ -58,78 +55,79 @@ def load_sqlite_bytes(db_bytes):
     try:
         conn = sqlite3.connect(tmp)
         cur = conn.cursor()
-
         cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
         tables = [x[0] for x in cur.fetchall()]
         if not tables:
             conn.close()
             return pd.DataFrame()
-
-        df = pd.read_sql_query(f"SELECT * FROM {tables[0]}", conn)
+        table = tables[0]
+        df = pd.read_sql_query(f"SELECT * FROM {table}", conn)
         conn.close()
 
-    except Exception as e:
-        st.error(f"SQLite read error: {e}")
+    except:
         return pd.DataFrame()
 
-    # 欄位 mapping
-    rename_map = {}
+    # Rename columns
+    rename = {}
     for col in df.columns:
-        lc = col.lower()
-        if lc == "id":
-            rename_map[col] = "id"
-        elif "work" in lc:
-            rename_map[col] = "work_order"
-        elif "shift" in lc:
-            rename_map[col] = "shift"
-        elif "device" in lc:
-            rename_map[col] = "device"
-        elif "timestamp" in lc:
-            rename_map[col] = "timestamp"
-        elif "time_str" in lc or "timestr" in lc or "time" in lc:
-            rename_map[col] = "time_str"
-        elif "temp" in lc:
-            rename_map[col] = "temperature"
-        elif "curr" in lc:
-            rename_map[col] = "current"
+        c = col.lower()
+        if c == "id":
+            rename[col] = "id"
+        elif "work" in c:
+            rename[col] = "work_order"
+        elif "shift" in c:
+            rename[col] = "shift"
+        elif "device" in c:
+            rename[col] = "device"
+        elif "timestamp" in c:
+            rename[col] = "timestamp"
+        elif "time" in c:
+            rename[col] = "time_str"
+        elif "temp" in c:
+            rename[col] = "temperature"
+        elif "curr" in c:
+            rename[col] = "current"
 
-    df = df.rename(columns=rename_map)
+    df = df.rename(columns=rename)
 
-    # 補齊欄位
-    for col in ["id", "work_order", "shift", "device", "timestamp", "time_str", "temperature", "current"]:
+    # Fill missing columns
+    needed = ["id", "work_order", "shift", "device", "timestamp", "time_str", "temperature", "current"]
+    for col in needed:
         if col not in df.columns:
             df[col] = None
 
-    # 時間轉換
     df["ts_dt"] = pd.to_datetime(df["time_str"], errors="coerce")
-
     return df.sort_values("ts_dt")
 
 
 # -----------------------------------------------------------
-# 📡 Real-time Zoomable Trend Page
+# 📡 Realtime Page (Zoomable + No Duplicate Keys)
 # -----------------------------------------------------------
 def realtime_page():
 
     st.header("📡 即時趨勢圖（Zoomable，5 秒自動更新）")
 
-    chart_area = st.empty()  # only refresh this block
+    # container only refreshes content inside (no duplicate keys)
+    plot_container = st.container()
 
+    # Start loop
     while True:
-        # 如果切換頁面 → 停止更新
+
+        # ⛔ If user switches page → stop loop
         if st.session_state.get("current_page") != "實時資料":
             break
 
         db_bytes = gh_download_file("Data/local/local_realtime.db")
         df = load_sqlite_bytes(db_bytes)
 
-        with chart_area:
+        with plot_container:
+            st.subheader("裝置圖表 (Auto-refresh)")
+
             if df.empty:
-                st.warning("尚無即時資料")
+                st.warning("尚無資料")
                 time.sleep(5)
                 continue
 
-            # 數值轉換
             df["temperature"] = pd.to_numeric(df["temperature"], errors="coerce")
             df["current"] = pd.to_numeric(df["current"], errors="coerce")
             df = df.dropna(subset=["ts_dt"])
@@ -141,10 +139,10 @@ def realtime_page():
                 if dev_df.empty:
                     continue
 
-                st.subheader(f"📟 裝置：{dev}")
+                st.markdown(f"### 📟 裝置：**{dev}**")
 
                 # ---------------------------------------------------------
-                # Temperature Plot (Zoomable)
+                # Temperature plot
                 # ---------------------------------------------------------
                 fig_temp = go.Figure()
                 fig_temp.add_trace(go.Scatter(
@@ -152,19 +150,19 @@ def realtime_page():
                     y=dev_df["temperature"],
                     mode="lines",
                     line=dict(color="red", width=2),
-                    name="Temperature"
                 ))
                 fig_temp.update_layout(
                     title="Temperature (°C)",
-                    height=300,
+                    height=280,
                     xaxis_title="Time",
-                    yaxis_title="Temperature",
-                    margin=dict(l=20, r=20, t=40, b=20)
+                    yaxis_title="°C",
+                    margin=dict(l=10, r=10, t=40, b=10)
                 )
-                st.plotly_chart(fig_temp, use_container_width=True, key=f"temp_{dev}")
+
+                st.plotly_chart(fig_temp, width="stretch", key=f"temp_{dev}_{time.time()}")
 
                 # ---------------------------------------------------------
-                # Current Plot (Zoomable)
+                # Current plot
                 # ---------------------------------------------------------
                 fig_curr = go.Figure()
                 fig_curr.add_trace(go.Scatter(
@@ -172,30 +170,31 @@ def realtime_page():
                     y=dev_df["current"],
                     mode="lines",
                     line=dict(color="blue", width=2),
-                    name="Current"
                 ))
                 fig_curr.update_layout(
                     title="Current (A)",
-                    height=300,
+                    height=280,
                     xaxis_title="Time",
-                    yaxis_title="Current",
-                    margin=dict(l=20, r=20, t=40, b=20)
+                    yaxis_title="A",
+                    margin=dict(l=10, r=10, t=40, b=10)
                 )
-                st.plotly_chart(fig_curr, use_container_width=True, key=f"curr_{dev}")
 
-        time.sleep(5)  # update every 5 seconds
+                st.plotly_chart(fig_curr, width="stretch", key=f"curr_{dev}_{time.time()}")
+
+        # Refresh every 5 seconds
+        time.sleep(5)
 
 
 # -----------------------------------------------------------
-# 📚 歷史資料頁面（原本版本即可）
+# Dummy History Page
 # -----------------------------------------------------------
 def history_page():
     st.header("📚 歷史資料")
-    st.info("（你可放你的歷史頁面程式碼）")
+    st.info("History page placeholder.")
 
 
 # -----------------------------------------------------------
-# Main Navigation
+# Navigation
 # -----------------------------------------------------------
 page = st.sidebar.radio("選單", ["實時資料", "歷史資料"])
 st.session_state["current_page"] = page
