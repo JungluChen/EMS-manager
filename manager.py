@@ -6,20 +6,21 @@ import base64
 import tempfile
 from pathlib import Path
 from datetime import datetime
+import altair as alt
 
 # ============================================================
-# Streamlit 設定
+# Streamlit Config
 # ============================================================
 st.set_page_config(page_title="EMS 管理台", layout="wide")
 st.title("EMS 管理台")
 
 # ============================================================
-# 讀取 GitHub DB（固定 EMS、避免讀 recording）
+# GitHub 設定（固定 EMS repo）
 # ============================================================
-GIT_OWNER  = st.secrets["GIT_OWNER"]
-GIT_REPO   = st.secrets["GIT_REPO"]
+GIT_OWNER = st.secrets["GIT_OWNER"]
+GIT_REPO = st.secrets["GIT_REPO"]
 GIT_BRANCH = st.secrets["GIT_BRANCH"]
-GIT_TOKEN  = st.secrets["GIT_TOKEN"]
+GIT_TOKEN = st.secrets["GIT_TOKEN"]
 
 def gh_headers():
     return {
@@ -28,20 +29,27 @@ def gh_headers():
     }
 
 def gh_download_file(path):
-    """下載 GitHub 上 EMS 的 DB。"""
     url = f"https://api.github.com/repos/{GIT_OWNER}/{GIT_REPO}/contents/{path}?ref={GIT_BRANCH}"
     r = requests.get(url, headers=gh_headers(), timeout=20)
 
     if r.status_code != 200:
+        st.error(f"❌ GitHub 下載失敗：HTTP {r.status_code} → {path}")
+        return None
+
+    js = r.json()
+    if "content" not in js:
+        st.error(f"❌ GitHub 回傳格式錯誤（缺少 content）")
         return None
 
     try:
-        return base64.b64decode(r.json()["content"])
-    except:
+        return base64.b64decode(js["content"])
+    except Exception:
+        st.error("❌ Base64 解碼失敗")
         return None
 
+
 # ============================================================
-# SQLite 通用讀取（標準化欄位）
+# SQLite 載入（自動欄位 mapping）
 # ============================================================
 def load_sqlite_bytes(db_bytes):
     if not db_bytes:
@@ -52,56 +60,91 @@ def load_sqlite_bytes(db_bytes):
 
     try:
         conn = sqlite3.connect(tmp)
-        df = pd.read_sql_query("SELECT * FROM records", conn)
+        cur = conn.cursor()
+
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        tables = [x[0] for x in cur.fetchall()]
+        if not tables:
+            return pd.DataFrame()
+        table = tables[0]
+
+        df = pd.read_sql_query(f"SELECT * FROM {table}", conn)
         conn.close()
-    except:
+
+    except Exception as e:
+        st.error(f"SQLite 讀取失敗：{e}")
         return pd.DataFrame()
 
-    mapping = {}
+    # 欄位 mapping
+    rename_map = {}
     for c in df.columns:
         lc = c.lower()
-        mapping[c] = (
-            "id" if lc == "id" else
-            "work_order" if "work" in lc else
-            "shift" if "shift" in lc else
-            "device" if "device" in lc else
-            "timestamp" if "timestamp" in lc else
-            "time_str" if "time" in lc else
-            "temperature" if "temp" in lc else
-            "current" if "curr" in lc else c
-        )
-    df = df.rename(columns=mapping)
+        if lc == "id":
+            rename_map[c] = "id"
+        elif "work" in lc:
+            rename_map[c] = "work_order"
+        elif "shift" in lc:
+            rename_map[c] = "shift"
+        elif "device" in lc:
+            rename_map[c] = "device"
+        elif "timestamp" in lc:
+            rename_map[c] = "timestamp"
+        elif "time" in lc:
+            rename_map[c] = "time_str"
+        elif "temp" in lc:
+            rename_map[c] = "temperature"
+        elif "curr" in lc:
+            rename_map[c] = "current"
 
-    # 補齊欄位
-    for col in ["id", "work_order", "shift", "device", "timestamp",
-                "time_str", "temperature", "current"]:
+    df = df.rename(columns=rename_map)
+
+    # 補欄位
+    for col in ["id", "work_order", "shift", "device",
+                "timestamp", "time_str", "temperature", "current"]:
         if col not in df.columns:
             df[col] = None
 
     df["ts_dt"] = pd.to_datetime(df["time_str"], errors="coerce")
+
     return df.sort_values("ts_dt")
 
+
 # ============================================================
-# 📡 實時資料（每 5 秒局部更新 + 圖表）
+# Real-time Page
 # ============================================================
+def chart_device(dev_df):
+    """合併溫度 + 電流的折線圖（共用 X 軸，Y 軸 0–100）"""
+
+    chart = alt.Chart(dev_df).transform_fold(
+        ["temperature", "current"],
+        as_=["type", "value"]
+    ).mark_line().encode(
+        x=alt.X("ts_dt:T", title="時間"),
+        y=alt.Y("value:Q", title="數值", scale=alt.Scale(domain=[0, 100])),
+        color=alt.Color("type:N", title="參數"),
+        tooltip=[
+            alt.Tooltip("ts_dt:T", title="時間"),
+            alt.Tooltip("type:N", title="種類"),
+            alt.Tooltip("value:Q", title="數值")
+        ]
+    ).properties(height=200)
+
+    return chart
+
+
 def realtime_page():
+    st.header("📡 即時資料（每 5 秒更新）")
 
-    st.header("📡 即時資料（每 5 秒自動更新）")
-
-    # 初始化 timer
+    # 5 秒局部刷新
     if "rt_last_refresh" not in st.session_state:
         st.session_state["rt_last_refresh"] = datetime.now()
 
-    # 計算是否距離上次 5 秒
     now = datetime.now()
-    diff = (now - st.session_state["rt_last_refresh"]).total_seconds()
-
-    # 只更新圖表，不刷新整頁
-    if diff >= 5:
+    if (now - st.session_state["rt_last_refresh"]).total_seconds() >= 5:
         st.session_state["rt_last_refresh"] = now
-        st.rerun()    # 🔥 局部 rerun 只刷新本頁，不跳轉、不跳回頂端
+        st.rerun()
 
-    # --- 讀取資料 ---
+    # --- Load DB ---
     db_bytes = gh_download_file("Data/local/local_realtime.db")
     df = load_sqlite_bytes(db_bytes)
 
@@ -112,17 +155,42 @@ def realtime_page():
     df["temperature"] = pd.to_numeric(df["temperature"], errors="coerce")
     df["current"] = pd.to_numeric(df["current"], errors="coerce")
 
-    st.subheader("📈 Temperature")
-    st.line_chart(df.set_index("ts_dt")["temperature"], height=260, width="stretch")
+    devices = sorted(df["device"].dropna().unique())
 
-    st.subheader("📉 Current")
-    st.line_chart(df.set_index("ts_dt")["current"], height=260, width="stretch")
+    N_PER_ROW = 2
+
+    for i in range(0, len(devices), N_PER_ROW):
+        row_devices = devices[i:i + N_PER_ROW]
+        cols = st.columns(len(row_devices))
+
+        for idx, dev in enumerate(row_devices):
+            dev_df = df[df["device"] == dev].sort_values("ts_dt")
+
+            if dev_df.empty:
+                continue
+
+            last_time = dev_df["ts_dt"].max()
+            delay = (now - last_time).total_seconds()
+
+            if delay < 10:
+                status = "🟢 Online"
+            elif delay < 30:
+                status = "🟠 Delayed"
+            else:
+                status = "🔴 Offline"
+
+            with cols[idx]:
+                st.markdown(f"### 🖥️ {dev}")
+                st.caption(f"Last update: **{last_time}**")
+                st.caption(f"Status: {status}")
+
+                st.altair_chart(chart_device(dev_df), use_container_width=True)
+
 
 # ============================================================
-# 📚 歷史資料頁面（完整）
+# History Page
 # ============================================================
 def history_page():
-
     st.header("📚 歷史資料")
 
     db_bytes = gh_download_file("Data/local/local_historical.db")
@@ -132,51 +200,45 @@ def history_page():
         st.info("尚無歷史資料")
         return
 
-    df["date"] = df["time_str"].str[:10]
+    df["temperature"] = pd.to_numeric(df["temperature"], errors="coerce")
+    df["current"] = pd.to_numeric(df["current"], errors="coerce")
 
-    sel_date = st.selectbox("選擇日期", sorted(df["date"].dropna().unique()))
+    df["date"] = df["time_str"].str[:10]
+    date_list = sorted(df["date"].dropna().unique())
+
+    sel_date = st.selectbox("選擇日期", date_list)
     df = df[df["date"] == sel_date]
 
     orders = sorted(df["work_order"].dropna().unique())
     sel_order = st.selectbox("工單", ["全部"] + orders)
+
     if sel_order != "全部":
         df = df[df["work_order"] == sel_order]
 
     devices = sorted(df["device"].dropna().unique())
-    sel_dev = st.selectbox("裝置（device）", ["全部"] + devices)
+    sel_dev = st.selectbox("機器", ["全部"] + devices)
+
     if sel_dev != "全部":
         df = df[df["device"] == sel_dev]
 
-    st.subheader("📃 篩選後資料")
+    st.subheader("📄 資料表")
     st.dataframe(df, width="stretch")
 
-    # --- 趨勢圖 ---
-    st.subheader("📈 歷史趨勢圖")
-
-    df["temperature"] = pd.to_numeric(df["temperature"], errors="coerce")
-    df["current"] = pd.to_numeric(df["current"], errors="coerce")
+    st.subheader("📈 趨勢圖")
 
     for dev in sorted(df["device"].dropna().unique()):
-        dev_df = df[df["device"] == dev]
+        dev_df = df[df["device"] == dev].sort_values("ts_dt")
+        if dev_df.empty:
+            continue
 
-        st.markdown(f"### 🟦 Device: {dev}")
+        st.markdown(f"### 🖥️ {dev}")
+        st.altair_chart(chart_device(dev_df), use_container_width=True)
 
-        c1, c2 = st.columns(2)
-
-        with c1:
-            st.write("Temperature")
-            st.line_chart(dev_df.set_index("ts_dt")["temperature"], height=250, width="stretch")
-
-        with c2:
-            st.write("Current")
-            st.line_chart(dev_df.set_index("ts_dt")["current"], height=250, width="stretch")
 
 # ============================================================
 # Main
 # ============================================================
 page = st.sidebar.radio("選單", ["實時資料", "歷史資料"])
-st.session_state["current_page"] = page
-
 if page == "實時資料":
     realtime_page()
 else:
