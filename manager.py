@@ -196,7 +196,7 @@ def load_history_db(date_filter=None):
     Data/local/local_historical.db
     Data/local/local_historical.db
     """
-    db = gh_download_file("Data/local/local_realtime.db")
+    db = gh_download_file("Data/local/local_historical.db")
     if not db:
         return pd.DataFrame()
 
@@ -432,6 +432,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
