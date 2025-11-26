@@ -110,11 +110,9 @@ def load_sqlite_bytes(db_bytes):
 
 
 # ============================================================
-# Real-time Page
+# 繪圖：合併溫度 + 電流（同圖）
 # ============================================================
 def chart_device(dev_df):
-    """合併溫度 + 電流的折線圖（共用 X 軸，Y 軸 0–100）"""
-
     chart = alt.Chart(dev_df).transform_fold(
         ["temperature", "current"],
         as_=["type", "value"]
@@ -132,10 +130,13 @@ def chart_device(dev_df):
     return chart
 
 
+# ============================================================
+# Real-time Page
+# ============================================================
 def realtime_page():
     st.header("📡 即時資料（每 5 秒更新）")
 
-    # 5 秒局部刷新
+    # 5 秒自動更新
     if "rt_last_refresh" not in st.session_state:
         st.session_state["rt_last_refresh"] = datetime.now()
 
@@ -157,7 +158,7 @@ def realtime_page():
 
     devices = sorted(df["device"].dropna().unique())
 
-    N_PER_ROW = 2
+    N_PER_ROW = 2  # 每列 2 台設備
 
     for i in range(0, len(devices), N_PER_ROW):
         row_devices = devices[i:i + N_PER_ROW]
@@ -165,11 +166,18 @@ def realtime_page():
 
         for idx, dev in enumerate(row_devices):
             dev_df = df[df["device"] == dev].sort_values("ts_dt")
-
             if dev_df.empty:
                 continue
 
-            last_time = dev_df["ts_dt"].max()
+            last = dev_df.iloc[-1]  # 最新資料
+            temp = last["temperature"]
+            curr = last["current"]
+
+            # 運行時長（秒）
+            runtime = (dev_df["ts_dt"].max() - dev_df["ts_dt"].min()).total_seconds()
+            runtime_str = f"{int(runtime//3600):02d}:{int((runtime%3600)//60):02d}:{int(runtime%60):02d}"
+
+            last_time = last["ts_dt"]
             delay = (now - last_time).total_seconds()
 
             if delay < 10:
@@ -180,10 +188,17 @@ def realtime_page():
                 status = "🔴 Offline"
 
             with cols[idx]:
-                st.markdown(f"### 🖥️ {dev}")
-                st.caption(f"Last update: **{last_time}**")
-                st.caption(f"Status: {status}")
+                st.markdown(f"## 🖥️ {dev}")
+                st.caption(f"狀態：{status}")
+                st.caption(f"最後更新：{last_time}")
 
+                # 三大指標
+                c1, c2, c3 = st.columns(3)
+                c1.metric("🌡 Temperature", f"{temp:.1f}°C")
+                c2.metric("⚡ Current", f"{curr:.2f} A")
+                c3.metric("⏱ 運行時長", runtime_str)
+
+                # 趨勢圖
                 st.altair_chart(chart_device(dev_df), use_container_width=True)
 
 
@@ -211,13 +226,11 @@ def history_page():
 
     orders = sorted(df["work_order"].dropna().unique())
     sel_order = st.selectbox("工單", ["全部"] + orders)
-
     if sel_order != "全部":
         df = df[df["work_order"] == sel_order]
 
     devices = sorted(df["device"].dropna().unique())
     sel_dev = st.selectbox("機器", ["全部"] + devices)
-
     if sel_dev != "全部":
         df = df[df["device"] == sel_dev]
 
@@ -225,13 +238,12 @@ def history_page():
     st.dataframe(df, width="stretch")
 
     st.subheader("📈 趨勢圖")
-
     for dev in sorted(df["device"].dropna().unique()):
         dev_df = df[df["device"] == dev].sort_values("ts_dt")
         if dev_df.empty:
             continue
 
-        st.markdown(f"### 🖥️ {dev}")
+        st.markdown(f"## 🖥️ {dev}")
         st.altair_chart(chart_device(dev_df), use_container_width=True)
 
 
