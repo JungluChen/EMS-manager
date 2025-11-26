@@ -156,7 +156,7 @@ def load_sqlite_from_bytes(db_bytes, date_filter=None):
 
 
 def load_realtime_db():
-    db = gh_download_file("Data/local/local_historical.db")
+    db = gh_download_file("Data/local/local_realtime.db")
     if not db:
         return pd.DataFrame()
 
@@ -432,6 +432,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
