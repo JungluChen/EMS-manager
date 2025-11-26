@@ -6,6 +6,7 @@ import base64
 import tempfile
 from pathlib import Path
 from datetime import datetime
+import altair as alt
 
 # ============================================================
 # Streamlit 設定
@@ -21,42 +22,47 @@ GIT_REPO   = st.secrets["GIT_REPO"]
 GIT_BRANCH = st.secrets["GIT_BRANCH"]
 GIT_TOKEN  = st.secrets["GIT_TOKEN"]
 
+@st.cache_data(show_spinner=False)
 def gh_headers():
     return {
         "Authorization": f"Bearer {GIT_TOKEN}",
         "Accept": "application/vnd.github+json"
     }
 
+@st.cache_data(ttl=5)
 def gh_download_file(path):
-    """下載 GitHub 上 EMS 的 DB。"""
-    url = f"https://api.github.com/repos/{GIT_OWNER}/{GIT_REPO}/contents/{path}?ref={GIT_BRANCH}"
-    r = requests.get(url, headers=gh_headers(), timeout=20)
-
-    if r.status_code != 200:
-        return None
-
+    """下載 GitHub 上 EMS 的檔案 bytes（含穩健網路處理）。"""
     try:
-        return base64.b64decode(r.json()["content"])
-    except:
+        url = f"https://api.github.com/repos/{GIT_OWNER}/{GIT_REPO}/contents/{path}?ref={GIT_BRANCH}"
+        r = requests.get(url, headers=gh_headers(), timeout=15)
+        if r.status_code != 200:
+            return None
+        j = r.json()
+        content = j.get("content")
+        if not isinstance(content, str):
+            return None
+        return base64.b64decode(content)
+    except Exception:
         return None
 
 # ============================================================
 # SQLite 通用讀取（標準化欄位）
 # ============================================================
+@st.cache_data(ttl=5)
 def load_sqlite_bytes(db_bytes):
     if not db_bytes:
         return pd.DataFrame()
-
     tmp = Path(tempfile.gettempdir()) / "ems_tmp.sqlite"
-    tmp.write_bytes(db_bytes)
-
+    try:
+        tmp.write_bytes(db_bytes)
+    except Exception:
+        return pd.DataFrame()
     try:
         conn = sqlite3.connect(tmp)
         df = pd.read_sql_query("SELECT * FROM records", conn)
         conn.close()
-    except:
+    except Exception:
         return pd.DataFrame()
-
     mapping = {}
     for c in df.columns:
         lc = c.lower()
@@ -71,52 +77,99 @@ def load_sqlite_bytes(db_bytes):
             "current" if "curr" in lc else c
         )
     df = df.rename(columns=mapping)
-
-    # 補齊欄位
-    for col in ["id", "work_order", "shift", "device", "timestamp",
-                "time_str", "temperature", "current"]:
+    for col in ["id", "work_order", "shift", "device", "timestamp", "time_str", "temperature", "current"]:
         if col not in df.columns:
             df[col] = None
-
     df["ts_dt"] = pd.to_datetime(df["time_str"], errors="coerce")
-    return df.sort_values("ts_dt")
+    df = df.sort_values("ts_dt")
+    return df
 
 # ============================================================
 # 📡 實時資料（每 5 秒局部更新 + 圖表）
 # ============================================================
-def realtime_page():
-
-    st.header("📡 即時資料（每 5 秒自動更新）")
-
-    # 初始化 timer
+def init_rt_state():
     if "rt_last_refresh" not in st.session_state:
         st.session_state["rt_last_refresh"] = datetime.now()
+    if "rt_start_time" not in st.session_state:
+        st.session_state["rt_start_time"] = datetime.now()
+    if "rt_prev_max_ts" not in st.session_state:
+        st.session_state["rt_prev_max_ts"] = None
+    if "rt_cached_df" not in st.session_state:
+        st.session_state["rt_cached_df"] = pd.DataFrame()
 
-    # 計算是否距離上次 5 秒
-    now = datetime.now()
-    diff = (now - st.session_state["rt_last_refresh"]).total_seconds()
-
-    # 只更新圖表，不刷新整頁
-    if diff >= 5:
-        st.session_state["rt_last_refresh"] = now
-        st.rerun()    # 🔥 局部 rerun 只刷新本頁，不跳轉、不跳回頂端
-
-    # --- 讀取資料 ---
-    db_bytes = gh_download_file("Data/local/local_realtime.db")
-    df = load_sqlite_bytes(db_bytes)
-
+@st.fragment(run_every=5)
+def realtime_page():
+    init_rt_state()
+    with st.spinner("讀取即時資料中..."):
+        db_bytes = gh_download_file("Data/local/local_realtime.db")
+        df = load_sqlite_bytes(db_bytes)
     if df.empty:
         st.info("尚無即時資料")
+        base_df = pd.DataFrame({"ts_dt": [pd.Timestamp.now()], "type": ["temperature"], "value": [None]})
+        base_chart = (
+            alt.Chart(base_df)
+            .mark_line(point=True)
+            .encode(
+                x=alt.X("ts_dt:T", title="時間", axis=alt.Axis(format="%Y/%m/%d %H:%M:%S", tickCount=10, labelAngle=45)),
+                y=alt.Y("value:Q", title="數值", scale=alt.Scale(domain=[0, 100])),
+                color=alt.Color("type:N", legend=alt.Legend(orient="top", title="類別"), scale=alt.Scale(domain=["current", "temperature"], range=["#3498db", "#e74c3c"]))
+            )
+            .properties(height=350)
+        )
+        st.altair_chart(base_chart, use_container_width=True)
         return
-
     df["temperature"] = pd.to_numeric(df["temperature"], errors="coerce")
     df["current"] = pd.to_numeric(df["current"], errors="coerce")
-
-    st.subheader("📈 Temperature")
-    st.line_chart(df.set_index("ts_dt")["temperature"], height=260, width="stretch")
-
-    st.subheader("📉 Current")
-    st.line_chart(df.set_index("ts_dt")["current"], height=260, width="stretch")
+    max_ts = None
+    try:
+        max_ts = df["ts_dt"].max()
+    except Exception:
+        max_ts = None
+    if max_ts and (st.session_state["rt_prev_max_ts"] is None or max_ts > st.session_state["rt_prev_max_ts"]):
+        st.session_state["rt_prev_max_ts"] = max_ts
+        st.session_state["rt_last_refresh"] = datetime.now()
+        if st.session_state["rt_start_time"] is None:
+            st.session_state["rt_start_time"] = datetime.now()
+        st.session_state["rt_cached_df"] = df.copy()
+    else:
+        # 使用上一次成功資料以提升穩定性
+        if not st.session_state["rt_cached_df"].empty:
+            df = st.session_state["rt_cached_df"].copy()
+    elapsed_sec = int((datetime.now() - st.session_state["rt_start_time"]).total_seconds()) if st.session_state.get("rt_start_time") else 0
+    elapsed_str = datetime.utcfromtimestamp(elapsed_sec).strftime("%H:%M:%S")
+    active = True if max_ts else False
+    color = "#22c55e" if active else "#ef4444"
+    st.markdown(f"<div>狀態：<span style='display:inline-block;width:12px;height:12px;border-radius:50%;background:{color};margin-right:6px;'></span>{'紀錄中' if active else '未紀錄'}</div>", unsafe_allow_html=True)
+    col_run, col_temp, col_curr = st.columns(3)
+    with col_run:
+        st.write("運行時間", elapsed_str)
+    with col_temp:
+        if df["temperature"].notna().any():
+            try:
+                st.write("🌡 溫度", f"{df['temperature'].dropna().iloc[-1]} °C")
+            except Exception:
+                pass
+    with col_curr:
+        if df["current"].notna().any():
+            try:
+                st.write("⚡ 電流", f"{df['current'].dropna().iloc[-1]} A")
+            except Exception:
+                pass
+    df_plot = df.dropna(subset=["ts_dt"]).copy()
+    df_melt = df_plot.melt(id_vars=["ts_dt"], value_vars=["temperature", "current"], var_name="type", value_name="value")
+    df_melt = df_melt.dropna(subset=["value"])
+    chart = (
+        alt.Chart(df_melt)
+        .mark_line(interpolate="linear", point=True)
+        .encode(
+            x=alt.X("ts_dt:T", title="時間", axis=alt.Axis(format="%Y/%m/%d %H:%M:%S", tickCount=10, labelAngle=45)),
+            y=alt.Y("value:Q", title="數值", scale=alt.Scale(domain=[0, 100])),
+            color=alt.Color("type:N", legend=alt.Legend(orient="top", title="類別"), scale=alt.Scale(domain=["current", "temperature"], range=["#3498db", "#e74c3c"])),
+            tooltip=["ts_dt:T", "type", "value"],
+        )
+        .properties(height=350)
+    )
+    st.altair_chart(chart, use_container_width=True)
 
 # ============================================================
 # 📚 歷史資料頁面（完整）
@@ -165,11 +218,33 @@ def history_page():
 
         with c1:
             st.write("Temperature")
-            st.line_chart(dev_df.set_index("ts_dt")["temperature"], height=250, width="stretch")
+            chart_temp = (
+                alt.Chart(dev_df.dropna(subset=["ts_dt"]))
+                .mark_line(interpolate="linear", point=True)
+                .encode(
+                    x=alt.X("ts_dt:T", title="時間", axis=alt.Axis(format="%Y/%m/%d %H:%M:%S", tickCount=10, labelAngle=45)),
+                    y=alt.Y("temperature:Q", title="數值", scale=alt.Scale(domain=[0, 100])),
+                    color=alt.value("#e74c3c"),
+                    tooltip=["ts_dt:T", "temperature"],
+                )
+                .properties(height=250)
+            )
+            st.altair_chart(chart_temp, use_container_width=True)
 
         with c2:
             st.write("Current")
-            st.line_chart(dev_df.set_index("ts_dt")["current"], height=250, width="stretch")
+            chart_curr = (
+                alt.Chart(dev_df.dropna(subset=["ts_dt"]))
+                .mark_line(interpolate="linear", point=True)
+                .encode(
+                    x=alt.X("ts_dt:T", title="時間", axis=alt.Axis(format="%Y/%m/%d %H:%M:%S", tickCount=10, labelAngle=45)),
+                    y=alt.Y("current:Q", title="數值", scale=alt.Scale(domain=[0, 100])),
+                    color=alt.value("#3498db"),
+                    tooltip=["ts_dt:T", "current"],
+                )
+                .properties(height=250)
+            )
+            st.altair_chart(chart_curr, use_container_width=True)
 
 # ============================================================
 # Main
