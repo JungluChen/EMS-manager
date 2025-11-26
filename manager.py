@@ -31,19 +31,29 @@ def gh_headers():
 
 @st.cache_data(ttl=5)
 def gh_download_file(path):
-    """下載 GitHub 上 EMS 的檔案 bytes（含穩健網路處理）。"""
+    """下載 GitHub 上 EMS 的檔案 bytes（含穩健網路處理）。回傳 (bytes, status)。"""
     try:
         url = f"https://api.github.com/repos/{GIT_OWNER}/{GIT_REPO}/contents/{path}?ref={GIT_BRANCH}"
         r = requests.get(url, headers=gh_headers(), timeout=15)
         if r.status_code != 200:
-            return None
+            return None, f"HTTP {r.status_code}"
         j = r.json()
         content = j.get("content")
-        if not isinstance(content, str):
-            return None
-        return base64.b64decode(content)
-    except Exception:
-        return None
+        if isinstance(content, str):
+            try:
+                return base64.b64decode(content), "ok"
+            except Exception:
+                pass
+        # fallback 使用 download_url 直接抓 raw
+        raw_url = j.get("download_url")
+        if raw_url:
+            rr = requests.get(raw_url, timeout=15)
+            if 200 <= rr.status_code < 300:
+                return rr.content, "ok"
+            return None, f"raw HTTP {rr.status_code}"
+        return None, "no-content"
+    except Exception as e:
+        return None, f"exception: {e.__class__.__name__}"
 
 # ============================================================
 # SQLite 通用讀取（標準化欄位）
@@ -101,10 +111,26 @@ def init_rt_state():
 def realtime_page():
     init_rt_state()
     with st.spinner("讀取即時資料中..."):
-        db_bytes = gh_download_file("Data/local/local_realtime.db")
+        db_bytes, status = gh_download_file("Data/local/local_realtime.db")
         df = load_sqlite_bytes(db_bytes)
+    st.caption(f"資料來源狀態：{status}")
     if df.empty:
         st.info("尚無即時資料")
+        base_df = pd.DataFrame({"ts_dt": [pd.Timestamp.now()], "type": ["temperature"], "value": [None]})
+        base_chart = (
+            alt.Chart(base_df)
+            .mark_line(point=True)
+            .encode(
+                x=alt.X("ts_dt:T", title="時間", axis=alt.Axis(format="%Y/%m/%d %H:%M:%S", tickCount=10, labelAngle=45)),
+                y=alt.Y("value:Q", title="數值", scale=alt.Scale(domain=[0, 100])),
+                color=alt.Color("type:N", legend=alt.Legend(orient="top", title="類別"), scale=alt.Scale(domain=["current", "temperature"], range=["#3498db", "#e74c3c"]))
+            )
+            .properties(height=350)
+        )
+        st.altair_chart(base_chart, use_container_width=True)
+        return
+    if df.dropna(subset=["ts_dt"]).empty:
+        st.info("資料時間欄位為空，暫無可視化")
         base_df = pd.DataFrame({"ts_dt": [pd.Timestamp.now()], "type": ["temperature"], "value": [None]})
         base_chart = (
             alt.Chart(base_df)
