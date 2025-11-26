@@ -177,14 +177,9 @@ def _compute_line_runtime(df):
 # Real-time DB
 # ============================================================
 def load_realtime_db():
-    # 優先讀取未壓縮，失敗則讀取壓縮檔
-    db = gh_download_file("real_time_monitoring/ems.db")
+    db = gh_download_file("Data/local/local_realtime.db")
     if not db:
-        db_gz = gh_download_file("real_time_monitoring/ems.db.gz")
-        if db_gz:
-            db = _decompress_if_gz("real_time_monitoring/ems.db.gz", db_gz)
-        if not db:
-            return pd.DataFrame()
+        return pd.DataFrame()
 
     tmp = Path(tempfile.gettempdir()) / "realtime.sqlite"
     tmp.write_bytes(db)
@@ -204,6 +199,7 @@ def load_realtime_db():
             obj = json.loads(data)
         except:
             obj = {}
+
         recs.append({
             "id": rid,
             "ts": ts,
@@ -226,18 +222,15 @@ def load_realtime_db():
 # ============================================================
 
 def load_history_db(date_filter=None):
-    # 優先讀取未壓縮，失敗則讀取壓縮檔
-    db = gh_download_file("historical_data/history.db")
+    db = gh_download_file("Data/local/local_historical.db")
     if not db:
-        db_gz = gh_download_file("historical_data/history.db.gz")
-        if db_gz:
-            db = _decompress_if_gz("historical_data/history.db.gz", db_gz)
-        if not db:
-            return pd.DataFrame()
+        return pd.DataFrame()
+
     return load_sqlite_from_bytes(db, date_filter=date_filter)
 
+
 def clear_history_db():
-    """清空 history.db（上傳新的空 DB）"""
+    """清空 local_historical.db（上傳新的空 DB）"""
     tmp = Path(tempfile.gettempdir()) / "empty_history.sqlite"
 
     conn = sqlite3.connect(tmp)
@@ -253,10 +246,11 @@ def clear_history_db():
     conn.close()
 
     return gh_upload_file(
-        "historical_data/history.db",
+        "Data/local/local_historical.db",
         tmp.read_bytes(),
-        message="reset history.db"
+        message="reset local_historical.db"
     )
+
 
 
 # ============================================================
@@ -460,6 +454,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
