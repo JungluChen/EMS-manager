@@ -19,7 +19,7 @@ except:
 st.set_page_config(page_title="EMS 管理台", layout="wide")
 
 # ============================================================
-# GitHub API Functions
+# GitHub API (強制只讀 EMS repo)
 # ============================================================
 
 def gh_headers():
@@ -35,276 +35,152 @@ def gh_owner_repo_branch():
         st.secrets.get("GIT_BRANCH", "main"),
     )
 
-def gh_repos():
-    primary = st.secrets.get("GIT_REPO", "")
-    alts = st.secrets.get("ALT_REPOS", "EMS,recording")
-    names = [x.strip() for x in (primary + "," + alts).split(",") if x.strip()]
-    seen = set(); out = []
-    for n in names:
-        if n not in seen:
-            out.append(n); seen.add(n)
-    return out
-
 def gh_download_file(path):
-    owner, _, branch = gh_owner_repo_branch()
-    for repo in gh_repos():
-        url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}?ref={branch}"
-        r = requests.get(url, headers=gh_headers(), timeout=20)
-        if r.status_code != 200:
-            continue
-        content = r.json().get("content", None)
-        if not content:
-            continue
-        try:
-            return base64.b64decode(content)
-        except:
-            continue
-    return None
-
-def gh_upload_file(path, content_bytes, message="update file"):
+    """只讀 EMS repo，不再讀 ALT_REPOS"""
     owner, repo, branch = gh_owner_repo_branch()
 
     url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}?ref={branch}"
-    r = requests.get(url, headers=gh_headers())
-    sha = r.json().get("sha") if r.status_code == 200 else None
+    r = requests.get(url, headers=gh_headers(), timeout=20)
 
-    b64 = base64.b64encode(content_bytes).decode("utf-8")
+    if r.status_code != 200:
+        st.error(f"下載失敗：HTTP {r.status_code} ({path})")
+        return None
 
-    payload = {"message": message, "content": b64, "branch": branch}
-    if sha:
-        payload["sha"] = sha
+    content = r.json().get("content")
+    if not content:
+        st.error("GitHub 回傳空內容")
+        return None
 
-    put_url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
-    pr = requests.put(put_url, headers=gh_headers(), json=payload)
-    return pr.status_code in (200, 201)
-
-
-# ============================================================
-# Helpers
-# ============================================================
-
-def safe_float(x, default=0.0):
-    try:
-        if x is None:
-            return default
-        return float(x)
-    except:
-        return default
-
-def _format_duration(sec):
-    try:
-        sec = int(max(0, float(sec)))
-    except:
-        sec = 0
-    return f"{sec//3600:02d}:{(sec%3600)//60:02d}:{sec%60:02d}"
-
-def _compute_device_runtime(df):
-    runtimes = {}
-    if df.empty:
-        return runtimes
-
-    for dev in df["device"].dropna().unique().tolist():
-        sub = df[df["device"] == dev]["ts_dt"].dropna()
-        if sub.empty:
-            continue
-        runtimes[dev] = (sub.max() - sub.min()).total_seconds()
-    return runtimes
+    return base64.b64decode(content)
 
 
 # ============================================================
-# SQLite Loading - New Schema
+# SQLite Loader + Debug Tools
 # ============================================================
 
-def load_sqlite_from_bytes(db_bytes, date_filter=None):
-    tmp = Path(tempfile.gettempdir()) / "tmp_history.sqlite"
+def debug_show_db(db_bytes):
+    """顯示 DB 基本資訊，方便抓問題"""
+    if not db_bytes:
+        st.write("❌ DB is None or empty")
+        return
+
+    st.write("📦 Downloaded DB size =", len(db_bytes), "bytes")
+
+    tmp = Path(tempfile.gettempdir()) / "debug.sqlite"
     tmp.write_bytes(db_bytes)
 
-    try:
-        conn = sqlite3.connect(str(tmp))
-        cur = conn.cursor()
+    conn = sqlite3.connect(tmp)
+    cur = conn.cursor()
 
-        if date_filter:
-            cur.execute(
-                """SELECT id, work_order, shift, device, timestamp, time_str,
-                          temperature, current
-                   FROM records
-                   WHERE time_str LIKE ?
-                   ORDER BY id ASC""",
-                (date_filter + "%",),
-            )
-        else:
-            cur.execute(
-                """SELECT id, work_order, shift, device, timestamp, time_str,
-                          temperature, current
-                   FROM records
-                   ORDER BY id ASC"""
-            )
-
-        rows = cur.fetchall()
-        conn.close()
-
-    except:
-        return pd.DataFrame()
-
-    df = pd.DataFrame(rows, columns=[
-        "id", "work_order", "shift", "device",
-        "timestamp", "time_str", "temperature", "current"
-    ])
-
-    df["ts_dt"] = pd.to_datetime(df["time_str"], errors="coerce")
-    return df
-
-
-def load_realtime_db():
-    db = gh_download_file("Data/local/local_realtime.db")
-    if not db:
-        return pd.DataFrame()
-
-    tmp = Path(tempfile.gettempdir()) / "realtime.sqlite"
-    tmp.write_bytes(db)
+    tables = cur.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+    st.write("📋 Tables:", tables)
 
     try:
-        conn = sqlite3.connect(tmp)
-        cur = conn.cursor()
-        cur.execute(
-            """SELECT id, work_order, shift, device, timestamp, time_str,
-                      temperature, current
-               FROM records
-               ORDER BY id DESC
-               LIMIT 1000"""
-        )
-        rows = cur.fetchall()
-        conn.close()
+        rows = cur.execute("SELECT * FROM records LIMIT 5").fetchall()
+        st.write("🔍 Sample rows:", rows)
     except:
-        return pd.DataFrame()
+        st.write("⚠ Table 'records' not found")
 
-    df = pd.DataFrame(rows, columns=[
-        "id", "work_order", "shift", "device",
-        "timestamp", "time_str", "temperature", "current"
-    ])
+    conn.close()
 
-    df["ts_dt"] = pd.to_datetime(df["time_str"], errors="coerce")
-    return df.sort_values("ts_dt")
 
+# ============================================================
+# History DB Loader (強制解析你的格式)
+# ============================================================
 
 def load_history_db(date_filter=None):
+
     db = gh_download_file("Data/local/local_historical.db")
     if not db:
         return pd.DataFrame()
 
+    # Debug output
+    with st.expander("🛠 Debug DB 內容 (可收起)"):
+        debug_show_db(db)
+
     tmp = Path(tempfile.gettempdir()) / "tmp_history.sqlite"
     tmp.write_bytes(db)
 
     try:
         conn = sqlite3.connect(tmp)
-        cur = conn.cursor()
-
-        # 取得所有 table
-        cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
-        tables = [t[0] for t in cur.fetchall()]
-        st.warning(f"tables detected: {tables}")  # ★ 印出來
-
-        target_table = None
-
-        # 自動尋找有你需要欄位的 table
-        for t in tables:
-            cur.execute(f"PRAGMA table_info('{t}')")
-            cols = [c[1].lower() for c in cur.fetchall()]
-            needed = {"id", "work_order", "shift", "device", "timestamp", "time_str", "temperature", "current"}
-
-            # 如果欄位有至少 4 個 match，就當作正確表
-            if len(needed.intersection(set(cols))) >= 4:
-                target_table = t
-                break
-
-        if not target_table:
-            st.error("⚠ 找不到符合欄位格式的資料表")
-            return pd.DataFrame()
-
-        df = pd.read_sql_query(f"SELECT * FROM {target_table}", conn)
+        df = pd.read_sql_query("SELECT * FROM records", conn)
         conn.close()
-
     except Exception as e:
-        st.error(f"讀取歷史資料庫失敗：{e}")
+        st.error(f"讀取資料失敗：{e}")
         return pd.DataFrame()
 
-    # 同上做欄位 rename
-    ...
-
-
-    # ---- 欄位 mapping 成統一格式 ----
-    rename_map = {}
-
-    for c in df.columns:
-        lc = c.lower()
-        if lc in ("id",):
-            rename_map[c] = "id"
-        elif "work" in lc:
-            rename_map[c] = "work_order"
-        elif "shift" in lc:
-            rename_map[c] = "shift"
-        elif "device" in lc:
-            rename_map[c] = "device"
-        elif "timestamp" in lc:
-            rename_map[c] = "timestamp"
-        elif "time_str" in lc or "timestr" in lc or "time" in lc:
-            rename_map[c] = "time_str"
-        elif "temp" in lc:
-            rename_map[c] = "temperature"
-        elif "curr" in lc:
-            rename_map[c] = "current"
-
-    df = df.rename(columns=rename_map)
-
-    # ---- 只保留標準欄位 ----
-    for col in ["id", "work_order", "shift", "device", "timestamp", "time_str", "temperature", "current"]:
+    # 補齊欄位（防止不同版本 DB）
+    for col in ["id", "work_order", "shift", "device",
+                "timestamp", "time_str", "temperature", "current"]:
         if col not in df.columns:
-            df[col] = None  # 補齊
+            df[col] = None
 
-    # ---- 轉換 timestamp/timestr ----
-    df["ts_dt"] = pd.to_datetime(df["time_str"], errors="coerce")
+    # 你的時間格式： 2025/11/26 13:13:28
+    df["ts_dt"] = pd.to_datetime(
+        df["time_str"],
+        format="%Y/%m/%d %H:%M:%S",
+        errors="coerce"
+    )
 
-    # ---- 日期過濾 ----
     if date_filter:
         df = df[df["time_str"].str.startswith(date_filter)]
 
     return df.sort_values("ts_dt")
 
 
-def clear_history_db():
-    tmp = Path(tempfile.gettempdir()) / "empty_history.sqlite"
+# ============================================================
+# Real-time Loader（保持不變）
+# ============================================================
 
-    conn = sqlite3.connect(tmp)
-    cur = conn.cursor()
-    cur.execute(
-        """CREATE TABLE IF NOT EXISTS records (
-               id INTEGER PRIMARY KEY AUTOINCREMENT,
-               work_order TEXT,
-               shift TEXT,
-               device TEXT,
-               timestamp REAL,
-               time_str TEXT,
-               temperature REAL,
-               current REAL
-           )"""
-    )
-    conn.commit()
-    conn.close()
+def load_realtime_db():
+    db = gh_download_file("Data/local/local_realtime.db")
+    if not db:
+        return pd.DataFrame()
 
-    return gh_upload_file(
-        "Data/local/local_historical.db",
-        tmp.read_bytes(),
-        message="reset local_historical.db"
-    )
+    tmp = Path(tempfile.gettempdir()) / "rt.sqlite"
+    tmp.write_bytes(db)
+
+    try:
+        conn = sqlite3.connect(tmp)
+        df = pd.read_sql_query(
+            """SELECT * FROM records ORDER BY id DESC LIMIT 1000""",
+            conn
+        )
+        conn.close()
+    except:
+        return pd.DataFrame()
+
+    df["ts_dt"] = pd.to_datetime(df["time_str"], errors="coerce")
+    return df.sort_values("ts_dt")
+
 
 # ============================================================
-# UI - Real-time Page
+# Utility
+# ============================================================
+
+def safe_float(x):
+    try:
+        return float(x)
+    except:
+        return 0.0
+
+def _compute_device_runtime(df):
+    runtimes = {}
+    if df.empty:
+        return runtimes
+    for dev in df["device"].dropna().unique():
+        sub = df[df["device"] == dev]["ts_dt"].dropna()
+        if sub.empty: continue
+        runtimes[dev] = (sub.max() - sub.min()).total_seconds()
+    return runtimes
+
+
+# ============================================================
+# UI: Real-time Data
 # ============================================================
 
 def realtime_page():
     st.header("实时数据")
-    st.caption("每 5 秒自动刷新")
-
     if st_autorefresh:
         st_autorefresh(interval=5000, key="rt-refresh")
 
@@ -313,134 +189,71 @@ def realtime_page():
         st.info("尚无实时数据")
         return
 
-    latest = df.sort_values("ts_dt").groupby("device").tail(1)
-    devices = sorted(latest["device"].dropna().unique().tolist())
+    latest = df.groupby("device").tail(1)
+    devices = sorted(latest["device"].unique())
     runtimes = _compute_device_runtime(df)
 
     cols = st.columns(len(devices))
     for i, dev in enumerate(devices):
-        sub = latest[latest["device"] == dev]
-
-        temp = safe_float(sub["temperature"].values[0])
-        curr = safe_float(sub["current"].values[0])
-
+        row = latest[latest["device"] == dev].iloc[0]
         with cols[i]:
-            st.metric(f"{dev} Temperature (°C)", f"{temp:.1f}")
-            st.metric(f"{dev} Current (A)", f"{curr:.2f}")
-            st.metric(f"{dev} 运行时长", _format_duration(runtimes.get(dev, 0)))
+            st.metric(f"{dev} Temperature", f"{safe_float(row.temperature):.1f}")
+            st.metric(f"{dev} Current", f"{safe_float(row.current):.2f}")
+            st.metric(f"{dev} Runtime", f"{int(runtimes.get(dev, 0))} sec")
 
-    st.divider()
+    st.subheader("設備快照")
+    st.dataframe(latest)
 
-    st.subheader("设备快照")
-    snap = latest.reset_index(drop=True).copy()
-    snap["runtime"] = snap.apply(
-        lambda r: _format_duration(runtimes.get(r["device"], 0)), axis=1
-    )
-    st.dataframe(snap)
-
-    st.divider()
-    st.subheader("趋势图")
-
+    st.subheader("趨勢圖")
     for dev in devices:
-        series = df[df["device"] == dev].sort_values("ts_dt")
-        if series.empty:
-            continue
+        sub = df[df["device"] == dev]
+        st.line_chart(sub.set_index("ts_dt")[["temperature", "current"]])
 
-        series["temperature"] = series["temperature"].apply(safe_float)
-        series["current"] = series["current"].apply(safe_float)
-
-        c1, c2 = st.columns(2)
-        with c1:
-            st.line_chart(series.set_index("ts_dt")["temperature"], height=200)
-        with c2:
-            st.line_chart(series.set_index("ts_dt")["current"], height=200)
 
 # ============================================================
-# UI - History Page
+# UI: History Data
 # ============================================================
 
 def history_page():
     st.header("历史数据")
 
-    df_history = load_history_db()
-    if df_history.empty:
+    df_all = load_history_db()
+    if df_all.empty:
         st.info("尚无历史数据")
         return
 
-    dates_db = sorted(df_history["time_str"].str[:10].unique().tolist())
-    sel = st.selectbox("选择日期", dates_db)
+    dates = sorted(df_all["time_str"].str[:10].unique())
+    sel_date = st.selectbox("選擇日期", dates)
 
-    df = load_history_db(date_filter=sel)
-    if df.empty:
-        st.info("没有记录")
-        return
+    df = load_history_db(sel_date)
 
-    orders = sorted(df["work_order"].dropna().unique().tolist())
-    sel_order = st.selectbox("工单", orders)
-
-    if sel_order:
-        df = df[df["work_order"] == sel_order]
+    st.subheader("資料表")
+    st.dataframe(df)
 
     runtimes = _compute_device_runtime(df)
-    snapshot = df.sort_values("ts_dt").groupby("device").tail(1)
+    st.subheader("設備快照")
+    st.write(runtimes)
 
-    snap = snapshot.reset_index(drop=True).copy()
-    snap["runtime"] = snap.apply(
-        lambda r: _format_duration(runtimes.get(r["device"], 0)), axis=1
-    )
-    st.dataframe(snap)
-
-    st.divider()
-
-    st.subheader("趋势图")
+    st.subheader("趨勢圖")
     for dev in sorted(df["device"].dropna().unique()):
-        series = df[df["device"] == dev].sort_values("ts_dt")
-        if series.empty:
-            continue
+        sub = df[df["device"] == dev]
+        st.line_chart(sub.set_index("ts_dt")[["temperature", "current"]])
 
-        series["temperature"] = series["temperature"].apply(safe_float)
-        series["current"] = series["current"].apply(safe_float)
-
-        c1, c2 = st.columns(2)
-        with c1:
-            st.line_chart(series.set_index("ts_dt")["temperature"], height=200)
-        with c2:
-            st.line_chart(series.set_index("ts_dt")["current"], height=200)
-
-    st.divider()
-    st.subheader("维护工具")
-
-    confirm = st.text_input("输入 DELETE 以清空 local_historical.db")
-    if st.button("清空 history.db"):
-        if confirm == "DELETE":
-            ok = clear_history_db()
-            if ok:
-                st.success("历史 DB 已清空并上传到 GitHub")
-            else:
-                st.error("清空失败")
-        else:
-            st.warning("确认文字不正确")
 
 # ============================================================
-# MAIN ENTRY
+# Main
 # ============================================================
 
 def main():
     st.title("EMS 管理台")
 
-    page = st.sidebar.radio("页面", ["实时数据", "历史数据"])
+    page = st.sidebar.radio("頁面", ["实时数据", "历史数据"])
 
     if page == "实时数据":
         realtime_page()
     else:
         history_page()
 
+
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
-
