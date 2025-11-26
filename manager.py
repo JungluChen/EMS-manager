@@ -188,53 +188,49 @@ def load_realtime_db():
 
 
 def load_history_db(date_filter=None):
-    """
-    更強健的 history.db 讀取器：
-    - 自動偵測表名
-    - 自動偵測欄位
-    - 自動 mapping 成標準欄位
-    Data/local/local_historical.db
-    Data/local/local_historical.db
-    """
     db = gh_download_file("Data/local/local_historical.db")
     if not db:
         return pd.DataFrame()
-    db = gh_download_file("Data/local/local_historical.db")
-    
-    if db:
-        st.warning(f"downloaded DB size = {len(db)} bytes")   # 🟡 這行用來驗證大小
-    else:
-        st.error("無法下載 DB (None returned)")
 
     tmp = Path(tempfile.gettempdir()) / "tmp_history.sqlite"
     tmp.write_bytes(db)
-    cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
-    table_list = [row[0] for row in cur.fetchall()]
-    st.warning(f"tables detected: {table_list}")
 
     try:
         conn = sqlite3.connect(tmp)
         cur = conn.cursor()
 
-        # 自動找出第一個資料表
+        # 取得所有 table
         cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
-        table_list = [row[0] for row in cur.fetchall()]
-        if not table_list:
-            conn.close()
+        tables = [t[0] for t in cur.fetchall()]
+        st.warning(f"tables detected: {tables}")  # ★ 印出來
+
+        target_table = None
+
+        # 自動尋找有你需要欄位的 table
+        for t in tables:
+            cur.execute(f"PRAGMA table_info('{t}')")
+            cols = [c[1].lower() for c in cur.fetchall()]
+            needed = {"id", "work_order", "shift", "device", "timestamp", "time_str", "temperature", "current"}
+
+            # 如果欄位有至少 4 個 match，就當作正確表
+            if len(needed.intersection(set(cols))) >= 4:
+                target_table = t
+                break
+
+        if not target_table:
+            st.error("⚠ 找不到符合欄位格式的資料表")
             return pd.DataFrame()
 
-        table = table_list[0]  # 使用第一個表
-
-        # 讀取全部資料
-        cur.execute(f"PRAGMA table_info('{table}')")
-        cols = [row[1] for row in cur.fetchall()]
-
-        df = pd.read_sql_query(f"SELECT * FROM {table}", conn)
+        df = pd.read_sql_query(f"SELECT * FROM {target_table}", conn)
         conn.close()
 
     except Exception as e:
         st.error(f"讀取歷史資料庫失敗：{e}")
         return pd.DataFrame()
+
+    # 同上做欄位 rename
+    ...
+
 
     # ---- 欄位 mapping 成統一格式 ----
     rename_map = {}
@@ -441,6 +437,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
