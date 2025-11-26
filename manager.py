@@ -70,17 +70,46 @@ def gh_upload_file(path, content_bytes, message="update file"):
 
     b64 = base64.b64encode(content_bytes).decode("utf-8")
 
-    payload = {
-        "message": message,
-        "content": b64,
-        "branch": branch
-    }
+    payload = {"message": message, "content": b64, "branch": branch}
     if sha:
         payload["sha"] = sha
 
     put_url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
     pr = requests.put(put_url, headers=gh_headers(), json=payload)
     return pr.status_code in (200, 201)
+
+
+# ============================================================
+# Helpers
+# ============================================================
+
+def safe_float(x, default=0.0):
+    try:
+        if x is None:
+            return default
+        return float(x)
+    except:
+        return default
+
+def _format_duration(sec):
+    try:
+        sec = int(max(0, float(sec)))
+    except:
+        sec = 0
+    return f"{sec//3600:02d}:{(sec%3600)//60:02d}:{sec%60:02d}"
+
+def _compute_device_runtime(df):
+    runtimes = {}
+    if df.empty:
+        return runtimes
+
+    for dev in df["device"].dropna().unique().tolist():
+        sub = df[df["device"] == dev]["ts_dt"].dropna()
+        if sub.empty:
+            continue
+        runtimes[dev] = (sub.max() - sub.min()).total_seconds()
+    return runtimes
+
 
 # ============================================================
 # SQLite Loading - New Schema
@@ -96,7 +125,7 @@ def load_sqlite_from_bytes(db_bytes, date_filter=None):
 
         if date_filter:
             cur.execute(
-                """SELECT id, work_order, shift, device, timestamp, time_str, 
+                """SELECT id, work_order, shift, device, timestamp, time_str,
                           temperature, current
                    FROM records
                    WHERE time_str LIKE ?
@@ -124,6 +153,7 @@ def load_sqlite_from_bytes(db_bytes, date_filter=None):
 
     df["ts_dt"] = pd.to_datetime(df["time_str"], errors="coerce")
     return df
+
 
 def load_realtime_db():
     db = gh_download_file("Data/local/local_realtime.db")
@@ -156,11 +186,13 @@ def load_realtime_db():
     df["ts_dt"] = pd.to_datetime(df["time_str"], errors="coerce")
     return df.sort_values("ts_dt")
 
+
 def load_history_db(date_filter=None):
     db = gh_download_file("Data/local/local_historical.db")
     if not db:
         return pd.DataFrame()
     return load_sqlite_from_bytes(db, date_filter=date_filter)
+
 
 def clear_history_db():
     tmp = Path(tempfile.gettempdir()) / "empty_history.sqlite"
@@ -189,27 +221,6 @@ def clear_history_db():
     )
 
 # ============================================================
-# Helpers
-# ============================================================
-
-def _format_duration(sec):
-    try:
-        sec = int(max(0, float(sec)))
-    except:
-        sec = 0
-    return f"{sec//3600:02d}:{(sec%3600)//60:02d}:{sec%60:02d}"
-
-def _compute_device_runtime(df):
-    runtimes = {}
-    if df.empty: return runtimes
-
-    for dev in df["device"].dropna().unique().tolist():
-        sub = df[df["device"] == dev]["ts_dt"].dropna()
-        if sub.empty: continue
-        runtimes[dev] = (sub.max() - sub.min()).total_seconds()
-    return runtimes
-
-# ============================================================
 # UI - Real-time Page
 # ============================================================
 
@@ -233,8 +244,8 @@ def realtime_page():
     for i, dev in enumerate(devices):
         sub = latest[latest["device"] == dev]
 
-        temp = float(sub["temperature"].values[0])
-        curr = float(sub["current"].values[0])
+        temp = safe_float(sub["temperature"].values[0])
+        curr = safe_float(sub["current"].values[0])
 
         with cols[i]:
             st.metric(f"{dev} Temperature (°C)", f"{temp:.1f}")
@@ -242,9 +253,12 @@ def realtime_page():
             st.metric(f"{dev} 运行时长", _format_duration(runtimes.get(dev, 0)))
 
     st.divider()
+
     st.subheader("设备快照")
     snap = latest.reset_index(drop=True).copy()
-    snap["runtime"] = snap.apply(lambda r: _format_duration(runtimes.get(r["device"], 0)), axis=1)
+    snap["runtime"] = snap.apply(
+        lambda r: _format_duration(runtimes.get(r["device"], 0)), axis=1
+    )
     st.dataframe(snap)
 
     st.divider()
@@ -252,7 +266,11 @@ def realtime_page():
 
     for dev in devices:
         series = df[df["device"] == dev].sort_values("ts_dt")
-        if series.empty: continue
+        if series.empty:
+            continue
+
+        series["temperature"] = series["temperature"].apply(safe_float)
+        series["current"] = series["current"].apply(safe_float)
 
         c1, c2 = st.columns(2)
         with c1:
@@ -290,14 +308,21 @@ def history_page():
     snapshot = df.sort_values("ts_dt").groupby("device").tail(1)
 
     snap = snapshot.reset_index(drop=True).copy()
-    snap["runtime"] = snap.apply(lambda r: _format_duration(runtimes.get(r["device"], 0)), axis=1)
+    snap["runtime"] = snap.apply(
+        lambda r: _format_duration(runtimes.get(r["device"], 0)), axis=1
+    )
     st.dataframe(snap)
 
     st.divider()
 
+    st.subheader("趋势图")
     for dev in sorted(df["device"].dropna().unique()):
         series = df[df["device"] == dev].sort_values("ts_dt")
-        if series.empty: continue
+        if series.empty:
+            continue
+
+        series["temperature"] = series["temperature"].apply(safe_float)
+        series["current"] = series["current"].apply(safe_float)
 
         c1, c2 = st.columns(2)
         with c1:
@@ -308,7 +333,7 @@ def history_page():
     st.divider()
     st.subheader("维护工具")
 
-    confirm = st.text_input("输入 DELETE 以清空历史记录（local_historical.db）")
+    confirm = st.text_input("输入 DELETE 以清空 local_historical.db")
     if st.button("清空 history.db"):
         if confirm == "DELETE":
             ok = clear_history_db()
@@ -320,7 +345,7 @@ def history_page():
             st.warning("确认文字不正确")
 
 # ============================================================
-# MAIN
+# MAIN ENTRY
 # ============================================================
 
 def main():
